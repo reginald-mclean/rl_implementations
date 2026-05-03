@@ -397,11 +397,11 @@ def compute_gae(
 
     next_value = last_value
     next_adv = 0.0
-    for t in reversed(range(len(rewards)):
+    for t in reversed(range(len(rewards))):
         mask = 1.0 - dones[t]
         delta = rewards[t] + gamma * next_value * mask - values[t]
-        advantages[t] = delta + gamma * lam * mask * next_advantage
-        next_advantage = advantage[t]
+        advantages[t] = delta + gamma * lam * mask * next_adv
+        next_adv = advantages[t]
         next_value = values[t]
 
     return advantages, advantages + values
@@ -494,8 +494,27 @@ def ppo_loss_fn(
         approx_kl    = mean(-log_ratio)        ← monitors policy change
         clip_fraction = mean(|ratio - 1| > clip_eps)  ← fraction of clipped steps
     """
-    raise NotImplementedError
+    log_probs, entropy, values = evaluate_actions(params, states, actions)
 
+    adv_norm = (advantages - advantages.mean())/(advantages.std() + 1e-6)
+    adv_norm = jax.lax.stop_gradient(adv_norm)
+
+    log_ratio = log_probs - old_log_probs
+    ratio = jnp.exp(log_ratio)
+    surr1 = ratio * adv_norm
+    surr2 = jnp.clip(ratio, 1-clip_eps, 1+clip_eps) * adv_norm
+    l_clip = jnp.mean(jnp.minimum(surr1, surr2))
+
+    returns = jax.lax.stop_gradient(returns)
+    l_value = jnp.mean((values - returns) ** 2)
+
+    l_entropy = entropy.mean()
+
+    l_total = -l_clip + value_coef * l_value - entropy_coef * l_entropy
+
+
+    return l_total, {'policy_loss': l_clip, 'value_loss': l_value, 'entropy': l_entropy,
+                         'approx_kl': jnp.mean(-log_ratio), 'clip_fraction': jnp.mean(jnp.abs(ratio - 1) > clip_eps)}
 
 def ppo_update(
     params: Dict,
@@ -519,7 +538,10 @@ def ppo_update(
         new_params: updated actor-critic weights
         info:       diagnostic dict from ppo_loss_fn
     """
-    raise NotImplementedError
+    (loss, info), grads = jax.value_and_grad(ppo_loss_fn, has_aux=True)(params, states, actions, old_log_probs, advantages, returns, clip_eps, value_coef, entropy_coef)
+    new_params = jax.tree.map(lambda p, g: p - lr*g, params, grads)
+
+    return new_params, info
 
 
 def ppo_epoch(
@@ -565,6 +587,10 @@ def ppo_epoch(
         Q2. What does approx_kl tell you about whether to stop early?
             (See the "early stopping" stretch goal.)
     """
+    print(rollout)
+    exit(0)
+
+
     raise NotImplementedError
 
 

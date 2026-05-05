@@ -25,6 +25,7 @@ Run individual sections with:
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from typing import Tuple, Dict, Optional
 import argparse
 
@@ -297,6 +298,7 @@ class ReplayBuffer:
         self.pos += 1
         if self.pos == self.max_size:
             self.full = True
+            self.pos = 0 # added this to move pos back to start
 
 
     def sample(self, batch_size: int) -> Dict[str, jax.Array]:
@@ -491,18 +493,16 @@ def actor_update(
 
     return new_log_alpha, new_alpha, {'alpha_loss': alpha_loss, 'alpha': new_alpha}'''
 
-def alpha_update(log_alpha, log_probs, target_entropy, lr=3e-4):
-    H_current = -log_probs.mean()
-    H_target  = jnp.abs(target_entropy)
-    # grad of exp(log_alpha) * (H_target - H_current) wrt log_alpha
-    # = exp(log_alpha) * (H_target - H_current)
-    grad = jnp.exp(log_alpha) * (H_target - H_current)
-    new_log_alpha = log_alpha + lr * grad   # increases when H_current < H_target ✓
+def alpha_update(log_alpha, alpha_opt_state, log_probs, target_entropy, alpha_optimizer):
+    def alpha_loss_fn(log_alpha):
+        return -log_alpha * (log_probs + target_entropy).mean()
+
+    loss, grad = jax.value_and_grad(alpha_loss_fn)(log_alpha)
+    updates, new_opt_state = alpha_optimizer.update(grad, alpha_opt_state)
+    new_log_alpha = optax.apply_updates(log_alpha, updates)
     new_alpha = float(jnp.exp(new_log_alpha))
-    return new_log_alpha, new_alpha, {
-        'alpha_loss': float(jnp.exp(log_alpha) * (H_target - H_current)),
-        'alpha': new_alpha
-    }
+
+    return new_log_alpha, new_opt_state, new_alpha, {'alpha_loss': float(loss), 'alpha': new_alpha}
 
 
 def soft_update(
@@ -684,7 +684,7 @@ def train(
     action_dim = env.action_space.shape[0]
 
     if target_entropy is None:
-        target_entropy = float(action_dim)
+        target_entropy = -float(action_dim)
 
     key = jax.random.PRNGKey(0)
 
@@ -693,7 +693,7 @@ def train(
     policy_params        = init_policy(state_dim, action_dim, hidden_dim, key=pk)
     critic_params        = init_critic(state_dim, action_dim, hidden_dim, key=ck)
     target_critic_params = init_critic(state_dim, action_dim, hidden_dim, key=tck)
-    buffer               = ReplayBuffer(state_dim, action_dim)
+    buffer               = ReplayBuffer(state_dim, action_dim, max_size=int(1e4))
 
     # TODO: copy critic_params into target_critic_params so they start identical
     # Hint: jax.tree.map(lambda x: x, critic_params) returns a copy
@@ -702,6 +702,8 @@ def train(
 
     log_alpha = jnp.array(0.0)
     alpha     = float(jnp.exp(log_alpha))
+    alpha_optimizer = optax.adam(lr)
+    alpha_opt_state = alpha_optimizer.init(log_alpha)
 
     state, _ = env.reset()
     episode_return = 0.0
@@ -772,9 +774,9 @@ def train(
             # print(f"policy param norm change: {float(after - before):.6f}")
 
             # 3. Alpha
-            log_alpha, alpha, alpha_info = alpha_update(
-                log_alpha, log_probs, target_entropy, lr
-            )
+            log_alpha, alpha_opt_state, alpha, alpha_info = alpha_update(
+                log_alpha, alpha_opt_state, log_probs, target_entropy, alpha_optimizer
+                )
 
             # 4. Soft update target
             target_critic_params = soft_update(critic_params, target_critic_params, tau)

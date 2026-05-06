@@ -22,22 +22,16 @@ Run individual sections with:
     python sac_assignment_jax.py --section all # full training loop
 """
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from typing import Any, Tuple, Dict, Optional
+import functools
 import argparse
 
 from collections import deque
-
-# JAX uses explicit PRNG keys. Split a root key to get independent streams.
-# e.g.:
-#   key = jax.random.PRNGKey(42)
-#   key, subkey = jax.random.split(key)
-#   samples = jax.random.normal(subkey, shape=(batch, dim))
+from typing import Any, Tuple, Dict, Optional
+from tqdm import trange
 
 
 # ==============================================================================
@@ -57,8 +51,8 @@ from collections import deque
 def init_policy(
     state_dim: int,
     action_dim: int,
-    hidden_dim: int = 256,
-    key: jax.Array = jax.random.PRNGKey(0),
+    hidden_dim: int,
+    key: jax.Array,
 ) -> Dict:
     """
     Initialize policy weights as a plain dict.
@@ -68,7 +62,7 @@ def init_policy(
               -> Linear(action_dim) [mean head]
               -> Linear(action_dim) [log_std head]
 
-    Use jax.random.normal + * 0.01 for weights, jnp.zeros for biases.
+    Use jax.random.normal * 0.01 for weights, jnp.zeros for biases.
     Split the key for each weight matrix (jax.random.split).
 
     Returns a dict with keys:
@@ -84,7 +78,6 @@ def init_policy(
     w_log_std = jax.random.normal(sub4, shape=(hidden_dim, action_dim)) * 0.01
     b_log_std = jnp.zeros(action_dim)
 
-
     return {'w1': w1, 'w2': w2, 'b1': b1, 'b2': b2, 'w_mean': w_mean, 'b_mean': b_mean, 'w_log_std': w_log_std, 'b_log_std': b_log_std}
 
 def policy_forward(
@@ -93,6 +86,7 @@ def policy_forward(
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Forward pass through the policy network.
+    No key is needed, this function is deterministic by definition.
 
     Args:
         params: dict of weights from init_policy
@@ -102,7 +96,7 @@ def policy_forward(
         mean:    (batch, action_dim)
         log_std: (batch, action_dim), clamped to [-20, 2]
 
-    Use jnp.dot, jax.nn.relu, jnp.clip.
+    Uses jnp.dot, jax.nn.relu, jnp.clip.
     """
 
     x = jnp.dot(state, params['w1']) + params['b1']
@@ -125,6 +119,8 @@ def policy_sample(
     """
     Sample an action using the reparameterization trick and compute its
     log probability under the squashed Gaussian.
+
+    The @jax.jit decorator is applied to any jittable function called in here.
 
     Note: key is now an explicit argument — JAX has no global RNG state.
     Use jax.random.normal(key, shape) to sample epsilon.
@@ -156,9 +152,8 @@ def policy_sample(
     pre_tanh = mean + std * eps
     action = jnp.tanh(pre_tanh)
     log_prob = -0.5 * jnp.sum(eps**2 + jnp.log(2*jnp.pi), axis=-1) - jnp.sum(jnp.log(1-action**2 + 1e-6), axis=-1)
+    
     return action, log_prob
-
-
 
 
 # ==============================================================================
@@ -174,8 +169,8 @@ def policy_sample(
 def init_critic(
     state_dim: int,
     action_dim: int,
-    hidden_dim: int = 256,
-    key: jax.Array = jax.random.PRNGKey(0),
+    hidden_dim: int,
+    key: jax.Array,
 ) -> Dict:
     """
     Initialize weights for TWO independent critic networks as a single dict.
@@ -242,7 +237,6 @@ def critic_forward(
     q2 = jax.nn.relu(q2)
     q2 = jnp.dot(q2, params['w3_2']) + params['b3_2']
 
-
     return q1, q2
 
 
@@ -295,11 +289,11 @@ class ReplayBuffer:
         self.actions[self.pos, :] = action
         self.masks[self.pos] = 1 - float(done)
 
-
         self.pos += 1
+
         if self.pos == self.max_size:
             self.full = True
-            self.pos = 0 # added this to move pos back to start
+            self.pos = 0
 
 
     def sample(self, batch_size: int) -> Dict[str, jax.Array]:
@@ -502,6 +496,28 @@ def actor_update(
 
 @functools.partial(jax.jit, static_argnums=(4,))
 def alpha_update(log_alpha, alpha_opt_state, log_probs, target_entropy, alpha_optimizer):
+    """
+    Update the entropy temperature alpha so that policy entropy tracks
+    target_entropy.
+    We're treating alpha as a dual variable, optimizing it to match the
+    target_entropy.
+
+    Steps:
+        1. alpha_loss = -log_alpha * (log_probs + target_entropy).mean()
+        2. grad = jax.grad(lambda la: -la * (log_probs + target_entropy).mean())(log_alpha)
+        3. new_log_alpha = log_alpha - lr * grad
+        4. new_alpha = exp(new_log_alpha)
+
+    Returns:
+        new_log_alpha: scalar jax array
+        new_alpha:     float
+        info dict with 'alpha_loss', 'alpha'
+
+    Questions:
+        Q1. Why optimize log_alpha rather than alpha directly?
+        Q2. What happens to the loss when current entropy == target_entropy?
+        Q3. What does it mean if alpha converges to near zero? Near infinity?
+    """
     def alpha_loss_fn(log_alpha):
         return -log_alpha * jax.lax.stop_gradient(log_probs + target_entropy).mean()
 
@@ -671,6 +687,7 @@ def train(
     tau: float = 0.005,
     lr: float = 3e-4,
     log_interval: int = 1000,
+    plot: bool = False,
 ):
     """
     Full SAC training loop.
@@ -701,6 +718,11 @@ def train(
     if target_entropy is None:
         target_entropy = -float(action_dim)
 
+    # JAX uses explicit PRNG keys. Split a root key to get independent streams.
+    # e.g.:
+    #   key = jax.random.PRNGKey(42)
+    #   key, subkey = jax.random.split(key)
+    #   samples = jax.random.normal(subkey, shape=(batch, dim))
     key = jax.random.PRNGKey(0)
 
     # --- Initialize components ---
@@ -710,9 +732,8 @@ def train(
     target_critic_params = init_critic(state_dim, action_dim, hidden_dim, key=tck)
     buffer               = ReplayBuffer(state_dim, action_dim, max_size=int(1e4))
 
-    # TODO: copy critic_params into target_critic_params so they start identical
-    # Hint: jax.tree.map(lambda x: x, critic_params) returns a copy
-
+    # Copy critic_params into target_critic_params so they start identical
+    # jax.tree.map(lambda x: x, critic_params) returns a copy
     target_critic_params = jax.tree.map(lambda x: x, critic_params)
 
     log_alpha = jnp.array(0.0)
@@ -731,7 +752,21 @@ def train(
 
     episodic_returns = deque(maxlen=20)
 
-    for step in range(num_steps):
+    if plot:
+        steps_log = []
+        critic_loss_log = []
+        actor_loss_log = []
+        entropy_log = []
+        alpha_log = []
+        q1_log = []
+        q2_log = []
+        episode_step_log = []
+        episode_return_log = []
+
+    from tqdm import tqdm
+    pbar = trange(num_steps, desc="SAC", unit="step", dynamic_ncols=True, position=1, leave=True)
+    metrics_bar = tqdm(bar_format="{desc}", position=0, leave=True)
+    for step in pbar:
 
         # --- Collect transition ---
         if step < warmup_steps:
@@ -752,6 +787,9 @@ def train(
 
         if done:
             episodic_returns.append(episode_return)
+            if plot:
+                episode_step_log.append(step)
+                episode_return_log.append(episode_return)
             state, _ = env.reset()
             episode_return = 0.0
 
@@ -781,20 +819,87 @@ def train(
             # 4. Soft update target
             target_critic_params = soft_update(critic_params, target_critic_params, tau)
 
+            if plot:
+                steps_log.append(step)
+                critic_loss_log.append(float(critic_info["critic_loss"]))
+                actor_loss_log.append(float(actor_info["actor_loss"]))
+                entropy_log.append(float(actor_info["entropy"]))
+                alpha_log.append(float(alpha_info["alpha"]))
+                q1_log.append(float(critic_info["q1_mean"]))
+                q2_log.append(float(critic_info["q2_mean"]))
+
             # --- Logging ---
             if step % log_interval == 0:
-                param_norm = sum(float(jnp.sum(p**2)) for p in jax.tree.leaves(policy_params))
-                print(
-                    f"step {step:7d} | "
-                    f"critic_loss {float(critic_info['critic_loss']):.4f} | "
-                    f"actor_loss {float(actor_info['actor_loss']):.4f} | "
-                    f"entropy {float(actor_info['entropy']):.4f} | "
-                    f"alpha {float(alpha_info['alpha']):.4f} | "
-                    f"episodic returns {np.mean(np.array(episodic_returns))}  | "
-                    f"q1_vals: {float(critic_info['q1_mean']):.4f} "
-                    f"q2_vals: {float(critic_info['q2_mean']):.4f} | "
-                    f"policy_norm {param_norm:.4f}"
+                metrics_bar.set_description_str(
+                    f"  ret={np.mean(np.array(episodic_returns)):.1f} | "
+                    f"alpha={float(alpha_info['alpha']):.3f} | "
+                    f"ent={float(actor_info['entropy']):.2f} | "
+                    f"c_loss={float(critic_info['critic_loss']):.1f} | "
+                    f"a_loss={float(actor_info['actor_loss']):.1f}"
                 )
+
+    metrics_bar.close()
+    pbar.close()
+
+    if plot:
+        return {
+            "steps": steps_log,
+            "critic_loss": critic_loss_log,
+            "actor_loss": actor_loss_log,
+            "entropy": entropy_log,
+            "alpha": alpha_log,
+            "q1": q1_log,
+            "q2": q2_log,
+            "episode_steps": episode_step_log,
+            "episode_returns": episode_return_log,
+            "target_entropy": target_entropy,
+        }
+
+
+def plot_diagnostics(logs):
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10), tight_layout=True)
+
+    axes[0, 0].plot(logs["episode_steps"], logs["episode_returns"], alpha=0.4, linewidth=0.8)
+    if len(logs["episode_returns"]) >= 20:
+        smoothed = np.convolve(logs["episode_returns"], np.ones(20) / 20, mode="valid")
+        axes[0, 0].plot(logs["episode_steps"][19:], smoothed, color="tab:red", linewidth=1.5)
+    axes[0, 0].set_title("Episode Return")
+    axes[0, 0].set_xlabel("step")
+    axes[0, 0].set_ylabel("return")
+
+    axes[0, 1].plot(logs["steps"], logs["critic_loss"], linewidth=0.5, alpha=0.6)
+    axes[0, 1].set_title("Critic Loss")
+    axes[0, 1].set_xlabel("step")
+    axes[0, 1].set_ylabel("loss")
+
+    axes[1, 0].plot(logs["steps"], logs["actor_loss"], linewidth=0.5, alpha=0.6)
+    axes[1, 0].set_title("Actor Loss")
+    axes[1, 0].set_xlabel("step")
+    axes[1, 0].set_ylabel("loss")
+
+    axes[1, 1].plot(logs["steps"], logs["entropy"], linewidth=0.8, label="entropy")
+    axes[1, 1].axhline(logs["target_entropy"], color="tab:red", linestyle="--", label="target")
+    axes[1, 1].set_title("Entropy")
+    axes[1, 1].set_xlabel("step")
+    axes[1, 1].legend()
+
+    axes[2, 0].plot(logs["steps"], logs["alpha"], linewidth=0.8)
+    axes[2, 0].set_title("Alpha (temperature)")
+    axes[2, 0].set_xlabel("step")
+    axes[2, 0].set_ylabel("α")
+
+    axes[2, 1].plot(logs["steps"], logs["q1"], linewidth=0.5, alpha=0.6, label="Q1")
+    axes[2, 1].plot(logs["steps"], logs["q2"], linewidth=0.5, alpha=0.6, label="Q2")
+    axes[2, 1].set_title("Mean Q Values")
+    axes[2, 1].set_xlabel("step")
+    axes[2, 1].legend()
+
+    fig.savefig("sac_pendulum_diagnostics.png", dpi=150)
+    print("Saved plot to sac_pendulum_diagnostics.png")
+    plt.show()
+
 
 # ==============================================================================
 # STRETCH GOALS (implement after the above is working)
@@ -824,8 +929,9 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--section", type=str, default="checks",
+    parser.add_argument("--section", type=str, default="all",
                         choices=["1", "2", "3", "4", "5", "checks", "all"])
+    parser.add_argument("--plot", action="store_true", help="Show diagnostic plots after training")
     args = parser.parse_args()
 
     if args.section == "checks":
@@ -839,4 +945,7 @@ if __name__ == "__main__":
             raise
 
         env = gym.make("Pendulum-v1")
-        train(env, num_steps=100_000, log_interval=200)
+        logs = train(env, num_steps=100_000, log_interval=200, plot=args.plot)
+
+        if args.plot:
+            plot_diagnostics(logs)

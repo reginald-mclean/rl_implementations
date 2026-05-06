@@ -50,8 +50,14 @@ def train_and_plot(
     buffer = ReplayBuffer(state_dim, action_dim)
 
     log_alpha = jnp.array(0.0)
-    alpha = float(jnp.exp(log_alpha))
+    alpha = jnp.exp(log_alpha)
+
+    critic_optimizer = optax.adam(lr)
+    actor_optimizer = optax.adam(lr)
     alpha_optimizer = optax.adam(lr)
+
+    critic_opt_state = critic_optimizer.init(critic_params)
+    policy_opt_state = actor_optimizer.init(policy_params)
     alpha_opt_state = alpha_optimizer.init(log_alpha)
 
     state, _ = env.reset()
@@ -100,14 +106,15 @@ def train_and_plot(
             batch = buffer.sample(batch_size)
 
             key, ck_ = jax.random.split(key)
-            critic_params, critic_info = critic_update(
+            critic_params, critic_opt_state, critic_info = critic_update(
                 critic_params, target_critic_params, policy_params,
-                batch, alpha, gamma, lr, key=ck_,
+                critic_opt_state, batch, alpha, gamma, ck_, critic_optimizer,
             )
 
             key, ak_ = jax.random.split(key)
-            policy_params, log_probs, actor_info = actor_update(
-                policy_params, critic_params, batch, alpha, lr, key=ak_,
+            policy_params, policy_opt_state, log_probs, actor_info = actor_update(
+                policy_params, critic_params,
+                policy_opt_state, batch, alpha, ak_, actor_optimizer,
             )
 
             log_alpha, alpha_opt_state, alpha, alpha_info = alpha_update(

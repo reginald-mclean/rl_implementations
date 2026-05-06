@@ -22,11 +22,13 @@ Run individual sections with:
     python sac_assignment_jax.py --section all # full training loop
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from typing import Tuple, Dict, Optional
+from typing import Any, Tuple, Dict, Optional
 import argparse
 
 from collections import deque
@@ -36,8 +38,6 @@ from collections import deque
 #   key = jax.random.PRNGKey(42)
 #   key, subkey = jax.random.split(key)
 #   samples = jax.random.normal(subkey, shape=(batch, dim))
-
-ROOT_KEY = jax.random.PRNGKey(42)
 
 
 # ==============================================================================
@@ -116,6 +116,7 @@ def policy_forward(
     return means, log_std
 
 
+@jax.jit
 def policy_sample(
     params: Dict,
     state: jax.Array,
@@ -391,34 +392,35 @@ def critic_loss_fn(
 
 
 
+@functools.partial(jax.jit, static_argnums=(8,))
 def critic_update(
     critic_params: Dict,
     target_critic_params: Dict,
     policy_params: Dict,
+    critic_opt_state,
     batch: Dict[str, jax.Array],
-    alpha: float,
-    gamma: float = 0.99,
-    lr: float = 3e-4,
-    key: jax.Array = jax.random.PRNGKey(0),
-) -> Tuple[Dict, Dict[str, float]]:
+    alpha: jax.Array,
+    gamma: float,
+    key: jax.Array,
+    optimizer: optax.GradientTransformation,
+) -> Tuple[Dict, Any, Dict[str, jax.Array]]:
     """
-    Compute gradients of critic_loss_fn wrt critic_params and apply SGD.
-
-    Use jax.value_and_grad(critic_loss_fn) — differentiate wrt first argument.
-    Update with: new_params = jax.tree.map(lambda p, g: p - lr * g, params, grads)
+    Compute gradients of critic_loss_fn wrt critic_params and apply an Adam step.
 
     Returns:
         new_critic_params: updated critic weights
+        new_critic_opt_state: updated optimizer state
         info dict with 'critic_loss', 'q1_mean', 'q2_mean'
     """
-    loss, grads = jax.value_and_grad(critic_loss_fn)(critic_params, target_critic_params, policy_params, batch, alpha, gamma, key)
-    #grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
-
-    new_params = jax.tree.map(lambda p, g: p - lr*g, critic_params, grads)
+    loss, grads = jax.value_and_grad(critic_loss_fn)(
+        critic_params, target_critic_params, policy_params, batch, alpha, gamma, key
+    )
+    updates, new_opt_state = optimizer.update(grads, critic_opt_state)
+    new_params = optax.apply_updates(critic_params, updates)
 
     q1, q2 = critic_forward(new_params, batch['states'], batch['actions'])
 
-    return new_params, {'critic_loss': loss, 'q1_mean': jnp.mean(q1), 'q2_mean': jnp.mean(q2)}
+    return new_params, new_opt_state, {'critic_loss': loss, 'q1_mean': jnp.mean(q1), 'q2_mean': jnp.mean(q2)}
 
 
 def actor_loss_fn(
@@ -434,26 +436,31 @@ def actor_loss_fn(
     return jnp.mean(alpha * log_probs - min_q), log_probs
 
 
+@functools.partial(jax.jit, static_argnums=(6,))
 def actor_update(
     policy_params: Dict,
     critic_params: Dict,
+    policy_opt_state,
     batch: Dict[str, jax.Array],
-    alpha: float,
-    lr: float = 3e-4,
-    key: jax.Array = jax.random.PRNGKey(0),
-) -> Tuple[Dict, jax.Array, Dict[str, float]]:
+    alpha: jax.Array,
+    key: jax.Array,
+    optimizer: optax.GradientTransformation,
+) -> Tuple[Dict, Any, jax.Array, Dict[str, jax.Array]]:
     """
-    Compute gradients of actor_loss_fn wrt policy_params and apply SGD.
+    Compute gradients of actor_loss_fn wrt policy_params and apply an Adam step.
 
     Returns:
-        new_policy_params: updated policy weights
-        log_probs:         (batch,) — needed for alpha update
+        new_policy_params:    updated policy weights
+        new_policy_opt_state: updated optimizer state
+        log_probs:            (batch,) — needed for alpha update
         info dict with 'actor_loss', 'entropy'
     """
-    (loss, log_probs), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(policy_params, critic_params, batch, alpha, key)
-    #grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
-    new_params = jax.tree.map(lambda p, g: p - lr*g, policy_params, grads)
-    return new_params, log_probs, {'actor_loss': loss, 'entropy': -jnp.mean(log_probs)}
+    (loss, log_probs), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
+        policy_params, critic_params, batch, alpha, key
+    )
+    updates, new_opt_state = optimizer.update(grads, policy_opt_state)
+    new_params = optax.apply_updates(policy_params, updates)
+    return new_params, new_opt_state, log_probs, {'actor_loss': loss, 'entropy': -jnp.mean(log_probs)}
 
 
 '''def alpha_update(
@@ -493,18 +500,20 @@ def actor_update(
 
     return new_log_alpha, new_alpha, {'alpha_loss': alpha_loss, 'alpha': new_alpha}'''
 
+@functools.partial(jax.jit, static_argnums=(4,))
 def alpha_update(log_alpha, alpha_opt_state, log_probs, target_entropy, alpha_optimizer):
     def alpha_loss_fn(log_alpha):
-        return -log_alpha * (log_probs + target_entropy).mean()
+        return -log_alpha * jax.lax.stop_gradient(log_probs + target_entropy).mean()
 
     loss, grad = jax.value_and_grad(alpha_loss_fn)(log_alpha)
     updates, new_opt_state = alpha_optimizer.update(grad, alpha_opt_state)
     new_log_alpha = optax.apply_updates(log_alpha, updates)
-    new_alpha = float(jnp.exp(new_log_alpha))
+    new_alpha = jnp.exp(new_log_alpha)
 
-    return new_log_alpha, new_opt_state, new_alpha, {'alpha_loss': float(loss), 'alpha': new_alpha}
+    return new_log_alpha, new_opt_state, new_alpha, {'alpha_loss': loss, 'alpha': new_alpha}
 
 
+@jax.jit
 def soft_update(
     critic_params: Dict,
     target_critic_params: Dict,
@@ -591,20 +600,24 @@ def run_sanity_checks():
     print("=" * 60)
     log_alpha = jnp.array(0.0)
     target_entropy = float(action_dim)   # +2.0: entropy above this → decrease alpha
+    test_alpha_opt = optax.adam(3e-4)
+    test_alpha_state = test_alpha_opt.init(log_alpha)
 
     # Case 1: entropy too low (log_probs close to 0) → alpha should increase
     low_entropy_log_probs = jnp.full(batch_size, -0.1)   # entropy=0.1 < target=2.0
-    new_log_alpha, new_alpha, _ = alpha_update(log_alpha, low_entropy_log_probs, target_entropy)
-    assert new_alpha > float(jnp.exp(log_alpha)), \
-        f"Alpha should increase when entropy too low. Got {new_alpha:.4f} vs {float(jnp.exp(log_alpha)):.4f}"
-    print(f"  low entropy  -> alpha {float(jnp.exp(log_alpha)):.4f} -> {new_alpha:.4f}  (should increase)")
+    new_log_alpha, _, new_alpha, _ = alpha_update(
+        log_alpha, test_alpha_state, low_entropy_log_probs, target_entropy, test_alpha_opt)
+    assert float(new_alpha) > float(jnp.exp(log_alpha)), \
+        f"Alpha should increase when entropy too low. Got {float(new_alpha):.4f} vs {float(jnp.exp(log_alpha)):.4f}"
+    print(f"  low entropy  -> alpha {float(jnp.exp(log_alpha)):.4f} -> {float(new_alpha):.4f}  (should increase)")
 
     # Case 2: entropy too high (log_probs very negative) → alpha should decrease
     high_entropy_log_probs = jnp.full(batch_size, -10.0)  # entropy=10 > target=2.0
-    new_log_alpha, new_alpha, _ = alpha_update(log_alpha, high_entropy_log_probs, target_entropy)
-    assert new_alpha < float(jnp.exp(log_alpha)), \
-        f"Alpha should decrease when entropy too high. Got {new_alpha:.4f} vs {float(jnp.exp(log_alpha)):.4f}"
-    print(f"  high entropy -> alpha {float(jnp.exp(log_alpha)):.4f} -> {new_alpha:.4f}  (should decrease)")
+    new_log_alpha, _, new_alpha, _ = alpha_update(
+        log_alpha, test_alpha_state, high_entropy_log_probs, target_entropy, test_alpha_opt)
+    assert float(new_alpha) < float(jnp.exp(log_alpha)), \
+        f"Alpha should decrease when entropy too high. Got {float(new_alpha):.4f} vs {float(jnp.exp(log_alpha)):.4f}"
+    print(f"  high entropy -> alpha {float(jnp.exp(log_alpha)):.4f} -> {float(new_alpha):.4f}  (should decrease)")
     print("  PASSED\n")
 
     print("=" * 60)
@@ -619,13 +632,15 @@ def run_sanity_checks():
         'next_states': jnp.array(np.random.randn(batch_size, state_dim)),
         'masks':       jnp.zeros(batch_size),   # terminal → no bootstrap
     }
-    alpha = 0.2
+    alpha = jnp.array(0.2)
+    test_critic_opt = optax.adam(3e-4)
+    test_critic_opt_state = test_critic_opt.init(critic_params)
     q1_before, q2_before = critic_forward(critic_params, batch['states'], batch['actions'])
     for _ in range(50):
         key, update_key = jax.random.split(key)
-        critic_params, info = critic_update(
+        critic_params, test_critic_opt_state, info = critic_update(
             critic_params, target_critic_params, policy_params,
-            batch, alpha, key=update_key
+            test_critic_opt_state, batch, alpha, 0.99, update_key, test_critic_opt,
         )
     q1_after, q2_after = critic_forward(critic_params, batch['states'], batch['actions'])
     print(f"  q1 before: {q1_before.mean():.3f}, after: {q1_after.mean():.3f}  (should move toward 0)")
@@ -701,17 +716,20 @@ def train(
     target_critic_params = jax.tree.map(lambda x: x, critic_params)
 
     log_alpha = jnp.array(0.0)
-    alpha     = float(jnp.exp(log_alpha))
-    alpha_optimizer = optax.adam(lr)
-    alpha_opt_state = alpha_optimizer.init(log_alpha)
+    alpha     = jnp.exp(log_alpha)
+
+    critic_optimizer = optax.adam(lr)
+    actor_optimizer  = optax.adam(lr)
+    alpha_optimizer  = optax.adam(lr)
+
+    critic_opt_state = critic_optimizer.init(critic_params)
+    policy_opt_state = actor_optimizer.init(policy_params)
+    alpha_opt_state  = alpha_optimizer.init(log_alpha)
 
     state, _ = env.reset()
     episode_return = 0.0
 
     episodic_returns = deque(maxlen=20)
-
-
-    after = sum(jnp.sum(p**2) for p in jax.tree.leaves(policy_params))
 
     for step in range(num_steps):
 
@@ -739,39 +757,21 @@ def train(
 
         # --- Update ---
         if step >= warmup_steps and len(buffer) >= batch_size:
-
-            # 2. Check if the policy is actually changing over time
-            # Log the mean and std of actions sampled at a fixed state
-            test_state = jnp.zeros((1, state_dim))
-            key, k = jax.random.split(key)
-            test_actions, _ = policy_sample(policy_params, test_state, k)
-            #print(f"test action: {float(test_actions[0,0]):.4f}")
-
             batch = buffer.sample(batch_size)
-
-            # Are states and next_states different?
-            #print(f"state: {batch['states'][0]}")
-            #print(f"next_state: {batch['next_states'][0]}")
-            #print(f"reward: {batch['rewards'][0]}")
-            #print(f"mask: {batch['masks'][0]}")
-
-            #print(f"reward range in buffer: {batch['rewards'].min():.2f} to {batch['rewards'].max():.2f}")
 
             # 1. Critic
             key, ck = jax.random.split(key)
-            critic_params, critic_info = critic_update(
+            critic_params, critic_opt_state, critic_info = critic_update(
                 critic_params, target_critic_params, policy_params,
-                batch, alpha, gamma, lr, key=ck
+                critic_opt_state, batch, alpha, gamma, ck, critic_optimizer,
             )
 
             # 2. Actor
-            before = sum(jnp.sum(p**2) for p in jax.tree.leaves(policy_params))
             key, ak = jax.random.split(key)
-            policy_params, log_probs, actor_info = actor_update(
-                policy_params, critic_params, batch, alpha, lr, key=ak
+            policy_params, policy_opt_state, log_probs, actor_info = actor_update(
+                policy_params, critic_params,
+                policy_opt_state, batch, alpha, ak, actor_optimizer,
             )
-            # after = sum(jnp.sum(p**2) for p in jax.tree.leaves(policy_params))
-            # print(f"policy param norm change: {float(after - before):.6f}")
 
             # 3. Alpha
             log_alpha, alpha_opt_state, alpha, alpha_info = alpha_update(
@@ -783,17 +783,18 @@ def train(
 
             # --- Logging ---
             if step % log_interval == 0:
+                param_norm = sum(float(jnp.sum(p**2)) for p in jax.tree.leaves(policy_params))
                 print(
                     f"step {step:7d} | "
-                    f"critic_loss {critic_info['critic_loss']:.4f} | "
-                    f"actor_loss {actor_info['actor_loss']:.4f} | "
-                    f"entropy {actor_info['entropy']:.4f} | "
-                    f"alpha {alpha_info['alpha']:.4f} | "
+                    f"critic_loss {float(critic_info['critic_loss']):.4f} | "
+                    f"actor_loss {float(actor_info['actor_loss']):.4f} | "
+                    f"entropy {float(actor_info['entropy']):.4f} | "
+                    f"alpha {float(alpha_info['alpha']):.4f} | "
                     f"episodic returns {np.mean(np.array(episodic_returns))}  | "
-                    f"q1_vals: {critic_info['q1_mean']} q2_vals: {critic_info['q2_mean']}"
+                    f"q1_vals: {float(critic_info['q1_mean']):.4f} "
+                    f"q2_vals: {float(critic_info['q2_mean']):.4f} | "
+                    f"policy_norm {param_norm:.4f}"
                 )
-                after = sum(jnp.sum(p**2) for p in jax.tree.leaves(policy_params))
-                print(f"policy param norm change: {float(after - before):.6f}")
 
 # ==============================================================================
 # STRETCH GOALS (implement after the above is working)

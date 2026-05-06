@@ -678,6 +678,7 @@ def scale_action(action, action_space):
 
 def train(
     env,
+    env_params,
     num_steps: int = int(1e6),
     batch_size: int = 256,
     warmup_steps: int = 5000,
@@ -693,8 +694,8 @@ def train(
     Full SAC training loop.
 
     Args:
-        env: gymnasium environment with .reset(), .step(),
-             .observation_space, .action_space
+        env:            gymnax environment
+        env_params:     gymnax environment parameters
         num_steps:      total environment steps
         batch_size:     transitions per gradient update
         warmup_steps:   random actions before training starts
@@ -712,8 +713,8 @@ def train(
               actions, log_probs = policy_sample(policy_params, state, subkey)
         - Never reuse a key.
     """
-    state_dim  = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    state_dim  = env.observation_space(env_params).shape[0]
+    action_dim = env.action_space(env_params).shape[0]
 
     if target_entropy is None:
         target_entropy = -float(action_dim)
@@ -725,7 +726,7 @@ def train(
     #   samples = jax.random.normal(subkey, shape=(batch, dim))
     key = jax.random.PRNGKey(0)
 
-    # --- Initialize components ---
+    # --- Initialize Agent Components ---
     key, pk, ck, tck = jax.random.split(key, 4)
     policy_params        = init_policy(state_dim, action_dim, hidden_dim, key=pk)
     critic_params        = init_critic(state_dim, action_dim, hidden_dim, key=ck)
@@ -747,7 +748,10 @@ def train(
     policy_opt_state = actor_optimizer.init(policy_params)
     alpha_opt_state  = alpha_optimizer.init(log_alpha)
 
-    state, _ = env.reset()
+    # --- Initialize Env ---
+    key, rk = jax.random.split(key, 2)
+    obs, env_state = env.reset(rk, env_params)
+
     episode_return = 0.0
 
     episodic_returns = deque(maxlen=20)
@@ -770,27 +774,29 @@ def train(
 
         # --- Collect transition ---
         if step < warmup_steps:
-            action = env.action_space.sample()
+            key, ak = jax.random.split(key)
+            action = env.action_space(env_params).sample(ak)
         else:
             key, sample_key = jax.random.split(key)
             action_batch, _ = policy_sample(
-                policy_params, jnp.array(state[None]), sample_key
+                policy_params, obs[None], key=sample_key
             )
-            action = scale_action(np.array(action_batch[0]), env.action_space)
+            action = scale_action(action_batch[0], env.action_space(env_params))
 
-        next_state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        buffer.add(state, action/2, reward, next_state, done)
+        key, sk = jax.random.split(key)
+        next_obs, env_state, reward, done, _ = env.step(sk, env_state, action, env_params)
+        buffer.add(obs, action / 2, reward, next_obs, done)
 
-        episode_return += reward
-        state = next_state
+        episode_return += float(reward)
+        obs = next_obs
 
         if done:
             episodic_returns.append(episode_return)
             if plot:
                 episode_step_log.append(step)
                 episode_return_log.append(episode_return)
-            state, _ = env.reset()
+            key, rk = jax.random.split(key)
+            obs, env_state = env.reset(rk, env_params)
             episode_return = 0.0
 
         # --- Update ---
@@ -939,13 +945,13 @@ if __name__ == "__main__":
 
     elif args.section == "all":
         try:
-            import gymnasium as gym
+            import gymnax as gym
         except ImportError:
-            print("Install gymnasium:  pip install gymnasium")
+            print("Install gymnax:  pip install gymnax")
             raise
 
-        env = gym.make("Pendulum-v1")
-        logs = train(env, num_steps=100_000, log_interval=200, plot=args.plot)
+        env, env_params = gym.make("Pendulum-v1")
+        logs = train(env, env_params, num_steps=100_000, log_interval=200, plot=args.plot)
 
         if args.plot:
             plot_diagnostics(logs)

@@ -26,12 +26,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import flashbax as fbx
 import functools
 import argparse
 
-from collections import deque
-from typing import Any, Tuple, Dict, Optional
-from tqdm import trange
+from typing import Any, NamedTuple, Tuple, Dict, Optional
+from tqdm import tqdm
 
 
 # ==============================================================================
@@ -594,21 +594,35 @@ def run_sanity_checks():
     print("  PASSED\n")
 
     print("=" * 60)
-    print("Sanity Check 3: Replay Buffer")
+    print("Sanity Check 3: Flashbax Replay Buffer")
     print("=" * 60)
-    buf = ReplayBuffer(state_dim, action_dim, max_size=1000)
-    for _ in range(200):
-        s  = np.random.randn(state_dim)
-        a  = np.random.randn(action_dim)
-        r  = float(np.random.randn())
-        s2 = np.random.randn(state_dim)
-        d  = bool(np.random.rand() < 0.05)
-        buf.add(s, a, r, s2, d)
-    batch = buf.sample(batch_size)
-    assert batch['states'].shape == (batch_size, state_dim)
-    assert batch['masks'].shape == (batch_size,), f"{batch['masks'].shape}, {batch_size}"
-    assert jnp.all((batch['masks'] == 0) | (batch['masks'] == 1)), "Masks should be 0 or 1"
-    print(f"  sampled batch keys: {list(batch.keys())}")
+    init_transition = {
+        "obs": jnp.zeros(state_dim),
+        "action": jnp.zeros(action_dim),
+        "reward": jnp.zeros(()),
+        "next_obs": jnp.zeros(state_dim),
+        "mask": jnp.zeros(()),
+    }
+    buf = fbx.make_item_buffer(max_length=1000, min_length=batch_size, sample_batch_size=batch_size)
+    buf_state = buf.init(init_transition)
+    for i in range(200):
+        transition = {
+            "obs": jnp.array(np.random.randn(state_dim)),
+            "action": jnp.array(np.random.randn(action_dim)),
+            "reward": jnp.array(float(np.random.randn())),
+            "next_obs": jnp.array(np.random.randn(state_dim)),
+            "mask": jnp.array(1.0 if np.random.rand() > 0.05 else 0.0),
+        }
+        buf_state = buf.add(buf_state, transition)
+    assert buf.can_sample(buf_state), "Buffer should be sampleable after 200 adds"
+    sample_key = jax.random.PRNGKey(99)
+    batch = buf.sample(buf_state, sample_key)
+    assert batch.experience["obs"].shape == (batch_size, state_dim)
+    assert batch.experience["action"].shape == (batch_size, action_dim)
+    assert batch.experience["reward"].shape == (batch_size,)
+    assert batch.experience["mask"].shape == (batch_size,)
+    print(f"  sampled batch keys: {list(batch.experience.keys())}")
+    print(f"  obs shape: {batch.experience['obs'].shape}")
     print("  PASSED\n")
 
     print("=" * 60)
@@ -667,19 +681,46 @@ def run_sanity_checks():
 
     print("All sanity checks passed!")
 
-def scale_action(action, action_space):
-    low, high = action_space.low, action_space.high
-    return low + (action + 1.0) * 0.5 * (high - low)
-
 
 # ==============================================================================
-# PART 6: Training Loop
+# PART 6: Training Loop (fully JIT-compiled with lax.scan + flashbax)
 # ==============================================================================
+
+
+class TrainState(NamedTuple):
+    """
+    All mutable state packed into a single pytree.
+
+    jax.lax.scan requires its carry to be a pure JAX pytree — no Python
+    mutability allowed.
+    Unlike a Python loop where we can freely reassign variables
+    (params = new_params, buffer.add(...), etc.), inside a compiled scan
+    every piece of state that changes between steps must be explicitly
+    threaded through the carry and returned as output.
+
+    NamedTuple is a pytree by default in JAX, so this struct flows through
+    jit/scan without any special registration.
+    """
+
+    policy_params: Dict
+    critic_params: Dict
+    target_critic_params: Dict
+    log_alpha: jax.Array
+    alpha: jax.Array
+    critic_opt_state: Any
+    policy_opt_state: Any
+    alpha_opt_state: Any
+    env_state: Any
+    obs: jax.Array
+    buffer_state: Any
+    key: jax.Array
+    episode_return: jax.Array
+
 
 def train(
     env,
     env_params,
-    num_steps: int = int(1e6),
+    num_steps: int = int(1e5),
     batch_size: int = 256,
     warmup_steps: int = 5000,
     target_entropy: Optional[float] = None,
@@ -687,11 +728,11 @@ def train(
     gamma: float = 0.99,
     tau: float = 0.005,
     lr: float = 3e-4,
-    log_interval: int = 1000,
+    log_interval: int = 200,
     plot: bool = False,
 ):
     """
-    Full SAC training loop.
+    Fully JIT-compiled SAC training loop.
 
     Args:
         env:            gymnax environment
@@ -712,29 +753,26 @@ def train(
               key, subkey = jax.random.split(key)
               actions, log_probs = policy_sample(policy_params, state, subkey)
         - Never reuse a key.
+    
+    Structure:
+        1. Warmup: jitted lax.scan collecting random transitions
+        2. Training: outer Python loop (for logging) calling a jitted epoch_fn
+           that does log_interval environment steps + gradient updates via lax.scan
     """
-    state_dim  = env.observation_space(env_params).shape[0]
+    state_dim = env.observation_space(env_params).shape[0]
     action_dim = env.action_space(env_params).shape[0]
+    action_low = env.action_space(env_params).low
+    action_high = env.action_space(env_params).high
 
     if target_entropy is None:
         target_entropy = -float(action_dim)
 
-    # JAX uses explicit PRNG keys. Split a root key to get independent streams.
-    # e.g.:
-    #   key = jax.random.PRNGKey(42)
-    #   key, subkey = jax.random.split(key)
-    #   samples = jax.random.normal(subkey, shape=(batch, dim))
     key = jax.random.PRNGKey(0)
 
-    # --- Initialize Agent Components ---
-    key, pk, ck, tck = jax.random.split(key, 4)
+    # --- Initialize networks ---
+    key, pk, ck          = jax.random.split(key, 3)
     policy_params        = init_policy(state_dim, action_dim, hidden_dim, key=pk)
     critic_params        = init_critic(state_dim, action_dim, hidden_dim, key=ck)
-    target_critic_params = init_critic(state_dim, action_dim, hidden_dim, key=tck)
-    buffer               = ReplayBuffer(state_dim, action_dim, max_size=int(1e4))
-
-    # Copy critic_params into target_critic_params so they start identical
-    # jax.tree.map(lambda x: x, critic_params) returns a copy
     target_critic_params = jax.tree.map(lambda x: x, critic_params)
 
     log_alpha = jnp.array(0.0)
@@ -748,116 +786,241 @@ def train(
     policy_opt_state = actor_optimizer.init(policy_params)
     alpha_opt_state  = alpha_optimizer.init(log_alpha)
 
-    # --- Initialize Env ---
-    key, rk = jax.random.split(key, 2)
+    # --- Initialize flashbax buffer ---
+    init_transition = {
+        "obs": jnp.zeros(state_dim),
+        "action": jnp.zeros(action_dim),
+        "reward": jnp.zeros(()),
+        "next_obs": jnp.zeros(state_dim),
+        "mask": jnp.zeros(()),
+    }
+    buffer = fbx.make_item_buffer(
+        max_length=10_000,
+        min_length=batch_size,
+        sample_batch_size=batch_size,
+    )
+    buffer_state = buffer.init(init_transition)
+
+    # --- Initialize environment ---
+    key, rk = jax.random.split(key)
     obs, env_state = env.reset(rk, env_params)
 
-    episode_return = 0.0
+    # --- Scale action helper (closed over bounds) ---
+    def scale_action_jit(action):
+        return action_low + (action + 1.0) * 0.5 * (action_high - action_low)
 
-    episodic_returns = deque(maxlen=20)
+    # --- Warmup: explore with random actions ---
+    def explore_step(carry, _):
+        obs, env_state, buffer_state, key = carry
+        key, ak, sk, rk = jax.random.split(key, 4)
+        action = jax.random.uniform(ak, (action_dim,), minval=action_low, maxval=action_high)
+        next_obs, next_env_state, reward, done, _ = env.step(sk, env_state, action, env_params)
+        transition = {
+            "obs": obs,
+            "action": action / 2,
+            "reward": reward,
+            "next_obs": next_obs,
+            "mask": 1.0 - done,
+        }
+        buffer_state_new = buffer.add(buffer_state, transition)
+        new_obs, new_env_state = jax.lax.cond(
+            done,
+            lambda: env.reset(rk, env_params),
+            lambda: (next_obs, next_env_state),
+        )
+        return (new_obs, new_env_state, buffer_state_new, key), None
+
+    explore_fn = jax.jit(lambda carry: jax.lax.scan(explore_step, carry, None, length=warmup_steps))
+
+    print(f"Warming up ({warmup_steps} random steps)...")
+    (obs, env_state, buffer_state, key), _ = explore_fn((obs, env_state, buffer_state, key))
+    print("Warmup complete. Starting training...")
+
+    # --- Training step: act + learn ---
+    def train_step(carry, _):
+        state = carry
+        key, ak, sk, ck, pk, rk = jax.random.split(state.key, 6)
+
+        # Act
+        action_batch, _ = policy_sample(state.policy_params, state.obs[None], ak)
+        action = scale_action_jit(action_batch[0])
+        next_obs, next_env_state, reward, done, _ = env.step(sk, state.env_state, action, env_params)
+
+        transition = {
+            "obs": state.obs,
+            "action": action / 2,
+            "reward": reward,
+            "next_obs": next_obs,
+            "mask": 1.0 - done,
+        }
+        new_buffer_state = buffer.add(state.buffer_state, transition)
+
+        # Episode return tracking
+        new_episode_return = state.episode_return + reward
+        completed_return = jnp.where(done, new_episode_return, jnp.nan)
+        new_episode_return = jnp.where(done, 0.0, new_episode_return)
+
+        # Conditional reset
+        new_obs, new_env_state = jax.lax.cond(
+            done,
+            lambda: env.reset(rk, env_params),
+            lambda: (next_obs, next_env_state),
+        )
+
+        # Learn: sample from buffer
+        batch_data = buffer.sample(new_buffer_state, ck)
+        batch = {
+            "states": batch_data.experience["obs"],
+            "actions": batch_data.experience["action"],
+            "rewards": batch_data.experience["reward"],
+            "next_states": batch_data.experience["next_obs"],
+            "masks": batch_data.experience["mask"],
+        }
+
+        # Critic update
+        critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(
+            state.critic_params, state.target_critic_params, state.policy_params,
+            batch, state.alpha, gamma, pk,
+        )
+        critic_updates, new_critic_opt_state = critic_optimizer.update(critic_grads, state.critic_opt_state)
+        new_critic_params = optax.apply_updates(state.critic_params, critic_updates)
+
+        # Actor update
+        key2, actor_key = jax.random.split(key)
+        (actor_loss, log_probs), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
+            state.policy_params, new_critic_params, batch, state.alpha, actor_key,
+        )
+        actor_updates, new_policy_opt_state = actor_optimizer.update(actor_grads, state.policy_opt_state)
+        new_policy_params = optax.apply_updates(state.policy_params, actor_updates)
+
+        # Alpha update
+        def alpha_loss_fn_inner(la):
+            return -la * jax.lax.stop_gradient(log_probs + target_entropy).mean()
+
+        alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss_fn_inner)(state.log_alpha)
+        alpha_updates, new_alpha_opt_state = alpha_optimizer.update(alpha_grad, state.alpha_opt_state)
+        new_log_alpha = optax.apply_updates(state.log_alpha, alpha_updates)
+        new_alpha = jnp.exp(new_log_alpha)
+
+        # Soft update target
+        new_target_critic_params = jax.tree.map(
+            lambda w, w_t: tau * w + (1 - tau) * w_t, new_critic_params, state.target_critic_params
+        )
+
+        # Metrics
+        q1, q2 = critic_forward(new_critic_params, batch["states"], batch["actions"])
+        metrics = {
+            "critic_loss": critic_loss,
+            "actor_loss": actor_loss,
+            "entropy": -jnp.mean(log_probs),
+            "alpha": new_alpha,
+            "q1_mean": jnp.mean(q1),
+            "q2_mean": jnp.mean(q2),
+            "reward": reward,
+            "episode_return": completed_return,
+        }
+
+        new_state = TrainState(
+            policy_params=new_policy_params,
+            critic_params=new_critic_params,
+            target_critic_params=new_target_critic_params,
+            log_alpha=new_log_alpha,
+            alpha=new_alpha,
+            critic_opt_state=new_critic_opt_state,
+            policy_opt_state=new_policy_opt_state,
+            alpha_opt_state=new_alpha_opt_state,
+            env_state=new_env_state,
+            obs=new_obs,
+            buffer_state=new_buffer_state,
+            key=key2,
+            episode_return=new_episode_return,
+        )
+        return new_state, metrics
+
+    epoch_fn = jax.jit(lambda state: jax.lax.scan(train_step, state, None, length=log_interval))
+
+    # --- Build initial TrainState ---
+    train_state = TrainState(
+        policy_params=policy_params,
+        critic_params=critic_params,
+        target_critic_params=target_critic_params,
+        log_alpha=log_alpha,
+        alpha=alpha,
+        critic_opt_state=critic_opt_state,
+        policy_opt_state=policy_opt_state,
+        alpha_opt_state=alpha_opt_state,
+        env_state=env_state,
+        obs=obs,
+        buffer_state=buffer_state,
+        key=key,
+        episode_return=jnp.array(0.0),
+    )
+
+    # --- Outer training loop ---
+    num_train_steps = num_steps - warmup_steps
+    num_epochs = num_train_steps // log_interval
 
     if plot:
-        steps_log = []
-        critic_loss_log = []
-        actor_loss_log = []
-        entropy_log = []
-        alpha_log = []
-        q1_log = []
-        q2_log = []
-        episode_step_log = []
-        episode_return_log = []
+        all_metrics = {
+            "critic_loss": [], "actor_loss": [], "entropy": [],
+            "alpha": [], "q1": [], "q2": [], "episode_returns": [],
+        }
 
-    from tqdm import tqdm
-    pbar = trange(num_steps, desc="SAC", unit="step", dynamic_ncols=True, position=1, leave=True)
+    pbar = tqdm(total=num_train_steps, desc="SAC", unit="step", dynamic_ncols=True, position=1, leave=True)
     metrics_bar = tqdm(bar_format="{desc}", position=0, leave=True)
-    for step in pbar:
 
-        # --- Collect transition ---
-        if step < warmup_steps:
-            key, ak = jax.random.split(key)
-            action = env.action_space(env_params).sample(ak)
+    for _ in range(num_epochs):
+        train_state, metrics = epoch_fn(train_state)
+        pbar.update(log_interval)
+
+        # Extract interval summary
+        mean_critic_loss = float(jnp.mean(metrics["critic_loss"]))
+        mean_actor_loss = float(jnp.mean(metrics["actor_loss"]))
+        mean_entropy = float(jnp.mean(metrics["entropy"]))
+        cur_alpha = float(metrics["alpha"][-1])
+
+        # Episode returns (filter NaNs -- only completed episodes)
+        epoch_returns = metrics["episode_return"]
+        completed_mask = ~jnp.isnan(epoch_returns)
+        completed_returns = epoch_returns[completed_mask]
+        if completed_returns.size > 0:
+            mean_return = float(jnp.mean(completed_returns))
         else:
-            key, sample_key = jax.random.split(key)
-            action_batch, _ = policy_sample(
-                policy_params, obs[None], key=sample_key
-            )
-            action = scale_action(action_batch[0], env.action_space(env_params))
+            mean_return = float("nan")
 
-        key, sk = jax.random.split(key)
-        next_obs, env_state, reward, done, _ = env.step(sk, env_state, action, env_params)
-        buffer.add(obs, action / 2, reward, next_obs, done)
+        metrics_bar.set_description_str(
+            f"  ret={mean_return:.1f} | "
+            f"alpha={cur_alpha:.3f} | "
+            f"ent={mean_entropy:.2f} | "
+            f"c_loss={mean_critic_loss:.1f} | "
+            f"a_loss={mean_actor_loss:.1f}"
+        )
 
-        episode_return += float(reward)
-        obs = next_obs
-
-        if done:
-            episodic_returns.append(episode_return)
-            if plot:
-                episode_step_log.append(step)
-                episode_return_log.append(episode_return)
-            key, rk = jax.random.split(key)
-            obs, env_state = env.reset(rk, env_params)
-            episode_return = 0.0
-
-        # --- Update ---
-        if step >= warmup_steps and len(buffer) >= batch_size:
-            batch = buffer.sample(batch_size)
-
-            # 1. Critic
-            key, ck = jax.random.split(key)
-            critic_params, critic_opt_state, critic_info = critic_update(
-                critic_params, target_critic_params, policy_params,
-                critic_opt_state, batch, alpha, gamma, ck, critic_optimizer,
-            )
-
-            # 2. Actor
-            key, ak = jax.random.split(key)
-            policy_params, policy_opt_state, log_probs, actor_info = actor_update(
-                policy_params, critic_params,
-                policy_opt_state, batch, alpha, ak, actor_optimizer,
-            )
-
-            # 3. Alpha
-            log_alpha, alpha_opt_state, alpha, alpha_info = alpha_update(
-                log_alpha, alpha_opt_state, log_probs, target_entropy, alpha_optimizer
-                )
-
-            # 4. Soft update target
-            target_critic_params = soft_update(critic_params, target_critic_params, tau)
-
-            if plot:
-                steps_log.append(step)
-                critic_loss_log.append(float(critic_info["critic_loss"]))
-                actor_loss_log.append(float(actor_info["actor_loss"]))
-                entropy_log.append(float(actor_info["entropy"]))
-                alpha_log.append(float(alpha_info["alpha"]))
-                q1_log.append(float(critic_info["q1_mean"]))
-                q2_log.append(float(critic_info["q2_mean"]))
-
-            # --- Logging ---
-            if step % log_interval == 0:
-                metrics_bar.set_description_str(
-                    f"  ret={np.mean(np.array(episodic_returns)):.1f} | "
-                    f"alpha={float(alpha_info['alpha']):.3f} | "
-                    f"ent={float(actor_info['entropy']):.2f} | "
-                    f"c_loss={float(critic_info['critic_loss']):.1f} | "
-                    f"a_loss={float(actor_info['actor_loss']):.1f}"
-                )
+        if plot:
+            all_metrics["critic_loss"].append(mean_critic_loss)
+            all_metrics["actor_loss"].append(mean_actor_loss)
+            all_metrics["entropy"].append(mean_entropy)
+            all_metrics["alpha"].append(cur_alpha)
+            all_metrics["q1"].append(float(jnp.mean(metrics["q1_mean"])))
+            all_metrics["q2"].append(float(jnp.mean(metrics["q2_mean"])))
+            if completed_returns.size > 0:
+                all_metrics["episode_returns"].extend(completed_returns.tolist())
 
     metrics_bar.close()
     pbar.close()
 
     if plot:
+        steps = list(range(0, num_epochs * log_interval, log_interval))
         return {
-            "steps": steps_log,
-            "critic_loss": critic_loss_log,
-            "actor_loss": actor_loss_log,
-            "entropy": entropy_log,
-            "alpha": alpha_log,
-            "q1": q1_log,
-            "q2": q2_log,
-            "episode_steps": episode_step_log,
-            "episode_returns": episode_return_log,
+            "steps": steps,
+            "critic_loss": all_metrics["critic_loss"],
+            "actor_loss": all_metrics["actor_loss"],
+            "entropy": all_metrics["entropy"],
+            "alpha": all_metrics["alpha"],
+            "q1": all_metrics["q1"],
+            "q2": all_metrics["q2"],
+            "episode_steps": list(range(len(all_metrics["episode_returns"]))),
+            "episode_returns": all_metrics["episode_returns"],
             "target_entropy": target_entropy,
         }
 
@@ -894,7 +1057,7 @@ def plot_diagnostics(logs):
     axes[2, 0].plot(logs["steps"], logs["alpha"], linewidth=0.8)
     axes[2, 0].set_title("Alpha (temperature)")
     axes[2, 0].set_xlabel("step")
-    axes[2, 0].set_ylabel("α")
+    axes[2, 0].set_ylabel("\u03b1")
 
     axes[2, 1].plot(logs["steps"], logs["q1"], linewidth=0.5, alpha=0.6, label="Q1")
     axes[2, 1].plot(logs["steps"], logs["q2"], linewidth=0.5, alpha=0.6, label="Q2")

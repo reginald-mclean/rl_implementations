@@ -29,6 +29,7 @@ import optax
 import flashbax as fbx
 import functools
 import argparse
+import os
 
 from typing import Any, NamedTuple, Tuple, Dict, Optional
 from tqdm import tqdm
@@ -243,7 +244,7 @@ def critic_forward(
 
 
 # ==============================================================================
-# PART 4: The Updates
+# PART 3: The Updates
 # ==============================================================================
 # Core SAC training logic. Each update returns NEW params — no mutation.
 #
@@ -373,43 +374,6 @@ def actor_update(
     return new_params, new_opt_state, log_probs, {'actor_loss': loss, 'entropy': -jnp.mean(log_probs)}
 
 
-'''def alpha_update(
-    log_alpha: jax.Array,
-    log_probs: jax.Array,
-    target_entropy: float,
-    lr: float = 3e-4,
-) -> Tuple[jax.Array, float, Dict[str, float]]:
-    """
-    Update the entropy temperature alpha so that policy entropy tracks
-    target_entropy.
-
-    Steps:
-        1. alpha_loss = -log_alpha * (log_probs + target_entropy).mean()
-        2. grad = jax.grad(lambda la: -la * (log_probs + target_entropy).mean())(log_alpha)
-        3. new_log_alpha = log_alpha - lr * grad
-        4. new_alpha = exp(new_log_alpha)
-
-    Returns:
-        new_log_alpha: scalar jax array
-        new_alpha:     float
-        info dict with 'alpha_loss', 'alpha'
-
-    Questions:
-        Q1. Why optimize log_alpha rather than alpha directly?
-        Q2. What happens to the loss when current entropy == target_entropy?
-        Q3. What does it mean if alpha converges to near zero? Near infinity?
-    """
-
-    alpha_loss = -log_alpha * (log_probs + target_entropy).mean()
-    grad = jax.grad(lambda la: -la * (log_probs + target_entropy).mean())(log_alpha)
-    new_log_alpha = log_alpha + lr * grad
-    new_log_alpha = jnp.clip(new_log_alpha, -10, 2)
-    new_alpha = jnp.exp(new_log_alpha)
-    print(f"deficit={(log_probs + target_entropy).mean():.3f}")
-    print(f"  log_alpha={float(log_alpha):.3f}  deficit={(log_probs+target_entropy).mean():.3f}  grad={float(grad):.6f}")
-
-    return new_log_alpha, new_alpha, {'alpha_loss': alpha_loss, 'alpha': new_alpha}'''
-
 @functools.partial(jax.jit, static_argnums=(4,))
 def alpha_update(log_alpha, alpha_opt_state, log_probs, target_entropy, alpha_optimizer):
     """
@@ -467,7 +431,7 @@ def soft_update(
     return new_target_params
 
 # ==============================================================================
-# PART 5: Sanity Checks
+# PART 4: Sanity Checks
 # ==============================================================================
 
 def run_sanity_checks():
@@ -599,7 +563,7 @@ def run_sanity_checks():
 
 
 # ==============================================================================
-# PART 6: Training Loop (fully JIT-compiled with lax.scan + flashbax)
+# PART 5: Training Loop (fully JIT-compiled with lax.scan + flashbax)
 # ==============================================================================
 
 
@@ -726,6 +690,8 @@ def train(
         return action_low + (action + 1.0) * 0.5 * (action_high - action_low)
 
     # --- Warmup: explore with random actions ---
+    # lax.scan expects for loop functions of the form:
+    # (carry, per-step-input) -> (new_carry, per-step-output)
     def explore_step(carry, _):
         obs, env_state, buffer_state, key = carry
         key, ak, sk, rk = jax.random.split(key, 4)
@@ -753,6 +719,7 @@ def train(
     print("Warmup complete. Starting training...")
 
     # --- Training step: act + learn ---
+    # also lax.scan'd, per-step-output is a metrics dict
     def train_step(carry, _):
         state = carry
         key, ak, sk, ck, pk, rk = jax.random.split(state.key, 6)
@@ -981,9 +948,10 @@ def plot_diagnostics(logs):
     axes[2, 1].set_xlabel("step")
     axes[2, 1].legend()
 
-    fig.savefig("sac_pendulum_diagnostics.png", dpi=150)
-    print("Saved plot to sac_pendulum_diagnostics.png")
-    plt.show()
+    os.makedirs("plots", exist_ok=True)
+    fig.savefig("plots/sac_pendulum_diagnostics.png", dpi=300)
+    plt.close(fig)
+    print("Saved plot to plots/sac_pendulum_diagnostics.png")
 
 
 # ==============================================================================
